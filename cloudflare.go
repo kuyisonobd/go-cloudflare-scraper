@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -17,7 +18,21 @@ import (
 	"github.com/robertkrimen/otto"
 )
 
-const userAgent = `Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36`
+var uas = []string{
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/65.0.3325.181 Chrome/65.0.3325.181 Safari/537.36",
+	"Mozilla/5.0 (Linux; Android 7.0; Moto G (5) Build/NPPS25.137-93-8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.137 Mobile Safari/537.36",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 7_0_4 like Mac OS X) AppleWebKit/537.51.1 (KHTML, like Gecko) Version/7.0 Mobile/11B554a Safari/9537.53",
+	"Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:60.0) Gecko/20100101 Firefox/60.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.13; rv:59.0) Gecko/20100101 Firefox/59.0",
+	"Mozilla/5.0 (Windows NT 6.3; Win64; x64; rv:57.0) Gecko/20100101 Firefox/57.0",
+}
+
+var rng = rand.New(rand.NewSource(int64(time.Now().Nanosecond())))
+
+func randomAgent() string {
+	return uas[rng.Perm(len(uas))[0]]
+}
 
 type Transport struct {
 	upstream http.RoundTripper
@@ -34,7 +49,7 @@ func NewTransport(upstream http.RoundTripper) (*Transport, error) {
 
 func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.Header.Get("User-Agent") == "" {
-		r.Header.Set("User-Agent", userAgent)
+		r.Header.Set("User-Agent", randomAgent())
 	}
 
 	resp, err := t.upstream.RoundTrip(r)
@@ -44,11 +59,12 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 	isCloudflareServer := strings.HasPrefix(resp.Header.Get("Server"), "cloudflare")
 	// Check if Cloudflare anti-bot is on
-	if resp.StatusCode == 503 && isCloudflareServer {
+	for resp.StatusCode == 503 && isCloudflareServer {
 		log.Printf("Solving challenge for %s", resp.Request.URL.Hostname())
-		resp, err := t.solveChallenge(resp)
-
-		return resp, err
+		resp, err = t.solveChallenge(resp)
+		if err != nil {
+			return resp, err
+		}
 	}
 
 	return resp, err
