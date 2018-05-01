@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/robertkrimen/otto"
@@ -41,8 +42,9 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
+	isCloudflareServer := strings.HasPrefix(resp.Header.Get("Server"), "cloudflare")
 	// Check if Cloudflare anti-bot is on
-	if resp.StatusCode == 503 && resp.Header.Get("Server") == "cloudflare-nginx" {
+	if resp.StatusCode == 503 && isCloudflareServer {
 		log.Printf("Solving challenge for %s", resp.Request.URL.Hostname())
 		resp, err := t.solveChallenge(resp)
 
@@ -56,7 +58,7 @@ var jschlRegexp = regexp.MustCompile(`name="jschl_vc" value="(\w+)"`)
 var passRegexp = regexp.MustCompile(`name="pass" value="(.+?)"`)
 
 func (t Transport) solveChallenge(resp *http.Response) (*http.Response, error) {
-	time.Sleep(time.Second * 4) // Cloudflare requires a delay before solving the challenge
+	time.Sleep(time.Second * 8) // Cloudflare requires a delay before solving the challenge
 
 	b, err := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -78,17 +80,17 @@ func (t Transport) solveChallenge(resp *http.Response) (*http.Response, error) {
 	chkURL, _ := url.Parse("/cdn-cgi/l/chk_jschl")
 	u := resp.Request.URL.ResolveReference(chkURL)
 
-	js, err := t.extractJS(string(b))
+	js, err := extractJS(string(b), resp.Request.URL.Host)
 	if err != nil {
 		return nil, err
 	}
 
-	answer, err := t.evaluateJS(js)
+	answer, err := evaluateJS(js)
 	if err != nil {
 		return nil, err
 	}
 
-	params.Set("jschl_answer", strconv.Itoa(int(answer)+len(resp.Request.URL.Host)))
+	params.Set("jschl_answer", fmt.Sprint(float64(answer)))
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s?%s", u.String(), params.Encode()), nil)
 	if err != nil {
@@ -112,24 +114,26 @@ func (t Transport) solveChallenge(resp *http.Response) (*http.Response, error) {
 	return resp, nil
 }
 
-func (t Transport) evaluateJS(js string) (int64, error) {
+func evaluateJS(js string) (float64, error) {
 	vm := otto.New()
 	result, err := vm.Run(js)
 	if err != nil {
 		return 0, err
 	}
-	return result.ToInteger()
+	return result.ToFloat()
 }
 
-var jsRegexp = regexp.MustCompile(
-	`setTimeout\(function\(\){\s+(var ` +
-		`s,t,o,p,b,r,e,a,k,i,n,g,f.+?\r?\n[\s\S]+?a\.value =.+?)\r?\n`,
+var (
+	jsRegexp = regexp.MustCompile(
+		`setTimeout\(function\(\){\s+(var ` +
+			`s,t,o,p,b,r,e,a,k,i,n,g,f.+?\r?\n[\s\S]+?a\.value =.+?)\r?\n`,
+	)
+	jsReplace1Regexp = regexp.MustCompile(`a\.value = (.+ \+ t\.length).+`)
+	jsReplace2Regexp = regexp.MustCompile(`\s{3,}[a-z](?: = |\.).+`)
+	jsReplace3Regexp = regexp.MustCompile(`[\n\\']`)
 )
-var jsReplace1Regexp = regexp.MustCompile(`a\.value = (parseInt\(.+?\)).+`)
-var jsReplace2Regexp = regexp.MustCompile(`\s{3,}[a-z](?: = |\.).+`)
-var jsReplace3Regexp = regexp.MustCompile(`[\n\\']`)
 
-func (t Transport) extractJS(body string) (string, error) {
+func extractJS(body, host string) (string, error) {
 	matches := jsRegexp.FindStringSubmatch(body)
 	if len(matches) == 0 {
 		return "", errors.New("No matching javascript found")
@@ -142,6 +146,9 @@ func (t Transport) extractJS(body string) (string, error) {
 	// Strip characters that could be used to exit the string context
 	// These characters are not currently used in Cloudflare's arithmetic snippet
 	js = jsReplace3Regexp.ReplaceAllString(js, "")
+
+	// replace t.length with the length of the domain
+	js = strings.Replace(js, "t.length", strconv.Itoa(len(host)), -1)
 
 	return js, nil
 }
