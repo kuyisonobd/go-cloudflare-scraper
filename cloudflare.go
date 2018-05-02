@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -29,52 +30,110 @@ var uas = []string{
 }
 
 var rng = rand.New(rand.NewSource(int64(time.Now().Nanosecond())))
+var rua = uas[rng.Perm(len(uas))[0]]
 
+// randomAgent returns a random user agent from those above
 func randomAgent() string {
 	return uas[rng.Perm(len(uas))[0]]
 }
 
-type Transport struct {
-	upstream http.RoundTripper
-	cookies  http.CookieJar
+// keep user agent on redirect
+func keepUserAgent(req *http.Request, via []*http.Request) error {
+	req.Header.Set("User-Agent", via[0].UserAgent())
+	return nil
 }
 
-func NewTransport(upstream http.RoundTripper) (*Transport, error) {
+// A Client is basically an http.Client that is also capable of transparently
+// solving the cloudflare bot check.
+type Client struct {
+	*http.Client
+	ua string
+}
+
+// NewClient returns a new cloudflare client.
+func NewClient() *Client {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	return &Transport{upstream, jar}, nil
+	return NewClientJar(jar)
 }
 
-func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if r.Header.Get("User-Agent") == "" {
-		r.Header.Set("User-Agent", randomAgent())
+// NewClient returns a client using the provided CookieJar that is capable
+// of saving cookies and performing requests that automaticall solve
+// cloudflare challenges.
+func NewClientJar(jar http.CookieJar) *Client {
+	return &Client{
+		Client: &http.Client{
+			CheckRedirect: keepUserAgent,
+			Jar:           jar,
+		},
+		ua: randomAgent(),
 	}
+}
 
-	resp, err := t.upstream.RoundTrip(r)
+// Do API of http.Client
+func (c *Client) Do(r *http.Request) (*http.Response, error) {
+	// ensure a safe user-agent
+	if r.Header.Get("User-Agent") == "" {
+		r.Header.Set("User-Agent", c.ua)
+	}
+	resp, err := c.Client.Do(r)
+	if err != nil {
+		return resp, err
+	}
+	printHeaders(resp)
+	if isCloudflareCheck(resp) {
+		return c.solveChallenge(resp)
+	}
+	return resp, err
+}
+
+// Get API of http.Client.
+func (c *Client) Get(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
+	return c.Do(req)
+}
 
-	isCloudflareServer := strings.HasPrefix(resp.Header.Get("Server"), "cloudflare")
-	// Check if Cloudflare anti-bot is on
-	for resp.StatusCode == 503 && isCloudflareServer {
-		log.Printf("Solving challenge for %s", resp.Request.URL.Hostname())
-		resp, err = t.solveChallenge(resp)
-		if err != nil {
-			return resp, err
-		}
+// Post API of http.Client
+func (c *Client) Post(url string, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
 	}
+	req.Header.Set("Content-Type", contentType)
+	return c.Do(req)
+}
 
-	return resp, err
+// PostForm API of http.Client
+func (c *Client) PostForm(url string, data url.Values) (*http.Response, error) {
+	return c.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
+}
+
+func isCloudflareCheck(resp *http.Response) bool {
+	if resp.StatusCode == 503 && strings.HasPrefix(resp.Header.Get("Server"), "cloudflare") {
+		return true
+	}
+	return false
 }
 
 var jschlRegexp = regexp.MustCompile(`name="jschl_vc" value="(\w+)"`)
 var passRegexp = regexp.MustCompile(`name="pass" value="(.+?)"`)
 
-func (t Transport) solveChallenge(resp *http.Response) (*http.Response, error) {
-	time.Sleep(time.Second * 8) // Cloudflare requires a delay before solving the challenge
+func printHeaders(resp *http.Response) {
+	log.Println("Headers:")
+	for key, vals := range resp.Header {
+		log.Printf("%s: %+v", key, vals)
+	}
+}
+
+func (c *Client) solveChallenge(resp *http.Response) (*http.Response, error) {
+	// the js client code sleeps before submitting for ~4000-5000ms, but
+	// apparently this isn't long enough sometimes.
+	time.Sleep(time.Second * 8)
 
 	b, err := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -108,26 +167,19 @@ func (t Transport) solveChallenge(resp *http.Response) (*http.Response, error) {
 
 	params.Set("jschl_answer", fmt.Sprint(float64(answer)))
 
+	// make a new request, solving the cloudflare challenge
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s?%s", u.String(), params.Encode()), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", resp.Request.Header.Get("User-Agent"))
+	req.Header.Set("User-Agent", c.ua)
 	req.Header.Set("Referer", resp.Request.URL.String())
 
 	log.Printf("Requesting %s?%s", u.String(), params.Encode())
-	client := http.Client{
-		Transport: t.upstream,
-		Jar:       t.cookies,
-	}
-
-	resp, err = client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	return resp, nil
+	log.Printf("Headers: %+v", req.Header)
+	log.Printf("Cookies: %+v", c.Jar.Cookies(u))
+	return c.Do(req)
 }
 
 func evaluateJS(js string) (float64, error) {

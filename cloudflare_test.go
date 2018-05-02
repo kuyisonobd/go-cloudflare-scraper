@@ -21,14 +21,7 @@ func TestTransport(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	scraper, err := NewTransport(http.DefaultTransport)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	c := http.Client{
-		Transport: scraper,
-	}
+	c := NewClient()
 
 	res, err := c.Get(ts.URL)
 	if err != nil {
